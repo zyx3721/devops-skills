@@ -45,6 +45,12 @@ Prometheus 是原生 Prom，但数据可能同时存在：
 | `cpu_usage_idle` / `mem_used_percent` / `system_load_norm_5` | `categraf_system` |
 | `node_cpu_seconds_total` / `node_memory_*` | `node_exporter` |
 | 两者都有 | `mixed`（按对象/label 决策） |
+| `hwEntity*` / `hwWlan*` + `brand="huawei"` | `network_device`（华为AC/交换机） |
+| `ifHCInOctets` / `ifHCOutOctets` / `ifDescr` | `network_device`（标准SNMP接口） |
+| `cisco*` / `cefc*` / `cpm*` | `network_device`（思科） |
+| `hh3c*` / `h3c*` | `network_device`（华三） |
+
+> **网络设备画像详情和 PromQL 模板见 `references/network_device_metrics.md`**
 
 ### 聚合标签优先级
 
@@ -55,6 +61,15 @@ Prometheus 是原生 Prom，但数据可能同时存在：
 ### 建议（可选但强烈推荐）
 
 在 Categraf 或写入链路增加来源标签（如 `metrics_from="categraf"`），PromQL 更精准、更省 token。
+
+### 网络设备"接口流量"缺失的常见陷阱
+
+用户说"查接口流量"，但 Prom 中没有 `ifHC*`/`node_network_*`/`net_bytes_*` 指标。此时：
+1. 先看 series 有没有 `brand`/`job` label → 可能是 SNMP 采集的网络设备（华为/华三/思科），非主机
+2. 网络设备默认只采集 Entity-MIB（CPU/内存/温度/光模块），**接口流量 OID（ifMIB）需额外配置**
+3. 此时应该: 报告"流量指标缺失"+ 给出设备其他可用指标的综合分析 + 建议补充采集 OID
+
+详见 `references/network_device_metrics.md` 末尾的排查清单。
 
 ---
 
@@ -401,9 +416,10 @@ Prometheus 是原生 Prom，但数据可能同时存在：
 
 ---
 
-# Categraf 适配 PromQL 模板库（常用主机排障）
+## Categraf 适配 PromQL 模板库（常用主机排障）
 
 > 使用前先 `prom_detect_profile`，再按 profile 选模板；补充 `ident/instance/job` 过滤。
+> 网络设备模板见 `references/network_device_metrics.md`。
 
 ## 1) CPU 使用率
 - **categraf_system**：`100 - cpu_usage_idle{cpu="cpu-total"}`
@@ -428,6 +444,66 @@ Prometheus 是原生 Prom，但数据可能同时存在：
 ## 6) TCP TIME_WAIT
 - **categraf_system**：`netstat_tcp_time_wait`
 - **node_exporter**：`node_sockstat_TCP_tw`
+
+## 7) TCP CLOSE_WAIT（连接异常堆积信号）
+- **categraf_system**：`netstat_tcp_close_wait`（如有采集）
+- **node_exporter**：`node_sockstat_TCP_tw` 不直接等同，需 `node_netstat_Tcp_Closing` 或自定义采集
+- **⚠️ 运维经验**：CLOSE_WAIT 堆积通常是**上游问题**的下游表象，而非根因。排查链路应追溯至依赖服务（常见：Redis/DB 慢查询阻塞 → 上游线程池耗尽 → 连接无法正常关闭）。见 `references/redis_troubleshooting.md`。
+
+## 8) Redis 进程级指标（需 redis_exporter 或 Categraf redis 插件）
+- **redis_exporter**：`redis_connected_clients`、`redis_used_memory_bytes`、`redis_commands_processed_total`
+- **Categraf redis**：`redis_connected_clients`、`redis_used_memory_bytes`、`redis_commands_processed_total`
+- **⚠️ 关键**：Redis 单线程模型下，CPU 接近 100% 几乎必然是命令问题而非资源不足。见 `references/redis_troubleshooting.md`。
+
+---
+
+# Redis 模糊匹配扫描故障：PromQL 诊断分支
+
+> 源自生产事故复盘：服务大量 CLOSE_WAIT → 溯源至 Redis CPU 100% → 根因是业务高频执行 KEYS/SCAN MATCH 模糊匹配。
+
+**触发条件**：当出现以下任一组合时进入此分支：
+1. 主机 CPU 接近 100% 且进程归属为 redis-server（需 process exporter 或 top 确认）
+2. 服务侧大量 CLOSE_WAIT + 依赖链中含 Redis
+3. `redis_connected_clients` 持续增长不回落
+4. `redis_commands_processed_total` 的 rate 突增 + `redis_slowlog_length` 增长
+
+**诊断 PromQL（优先级从高到低）：**
+
+| 排查步骤 | PromQL | 目的 |
+|---|---|---|
+| 1. 确认 Redis CPU 是否异常 | `topk(3, 100 - cpu_usage_idle{cpu="cpu-total"})` 或进程级 `process_cpu_seconds_total{process_name="redis-server"}` | 定位问题宿主机 |
+| 2. 查 Redis 连接数趋势 | `redis_connected_clients{ident="X"}` | 连接是否堆积 |
+| 3. 查命令处理速率 | `rate(redis_commands_processed_total{ident="X"}[5m])` | 是否有突发命令量 |
+| 4. 查慢查询 | `increase(redis_slowlog_length{ident="X"}[5m])` | 慢查询是否增长 |
+| 5. 查 CLOSE_WAIT | `netstat_tcp_close_wait{ident="服务主机"}` | 确认下游表象 |
+| 6. 查 KEYS/SCAN 特征指标 | `rate(redis_commands_total{cmd="keys",ident="X"}[5m])` 或 `rate(redis_commands_total{cmd="scan",ident="X"}[5m])` | **直接定位根因命令** |
+
+**⚠️ 若 Prom 中无 `redis_commands_total` 按 cmd 分维度的指标**（仅靠 redis_exporter 默认配置可能不采集），需：
+- 登录 Redis 执行 `SLOWLOG GET 20` 确认慢命令类型
+- 或 `INFO commandstats` 查看 cmdstats 找到高频/耗时命令
+- 这一步无法纯靠 Prometheus 完成，是关键的**跨工具溯源点**
+
+**根因判定流程：**
+```
+CLOSE_WAIT 堆积
+  → 上游服务超时
+    → Redis CPU 100%
+      → 慢查询含 KEYS/SCAN MATCH？
+        → YES: 根因=业务模糊匹配扫描 → 止血=禁用/限流该命令 → 根治=改为精准查询
+        → NO:  继续排查其他 Redis CPU 飙高原因（持久化bgsave/bigkey/内存淘汰）
+```
+
+**止血方案（按风险递增）：**
+1. `redis-cli CONFIG SET slowlog-log-slower-than 10000` — 降低慢日志阈值以捕获更多证据（无风险）
+2. `redis-cli CLIENT LIST` — 找到占连接最多的 client（只读，无风险）
+3. 与业务方协商临时禁用模糊匹配接口（需协调，中风险）
+4. `redis-cli CLIENT KILL` 杀特定连接（**高风险，可能导致业务瞬时错误**）
+5. `redis-cli COMMAND DOCS KEYS` 确认命令存在后考虑 `rename-command` 禁用（**需重启，高风险**）
+
+**根治方向：**
+- KEYS → 改用精准 GET/HSGET 或维护 key 集合（SET）
+- SCAN MATCH → 改用 SCAN 无 MATCH + 客户端过滤，或建立反向索引
+- 必须在代码审查环节禁止 KEYS 命令进入生产
 
 ---
 
@@ -496,13 +572,21 @@ Prometheus 是原生 Prom，但数据可能同时存在：
 当需要调用 Prometheus API 时，参考 `scripts/prom_query.py`（如已创建）或直接用 curl。典型 curl 模式：
 
 ```bash
+# ⚠️ 注意: curl + match[] 中的花括号/等号/引号需要 URL 编码
+# 推荐: 用 -g 禁止 curl glob，并手动编码，或直接用 Python urllib（自动编码）
+
 # 检测配置
 PROM_URL="${PROMETHEUS_BASE_URL:-http://localhost:9090}"
 AUTH_HEADER=""
 [ -n "$PROMETHEUS_BEARER_TOKEN" ] && AUTH_HEADER="Authorization: Bearer $PROMETHEUS_BEARER_TOKEN"
 
-# instant query
+# instant query (简单查询没问题)
 curl -s "$PROM_URL/api/v1/query?query=up" ${AUTH_HEADER:+-H "$AUTH_HEADER"} | python3 -m json.tool
+
+# series with match[] — 必须用 -g + URL编码，或用 Python:
+# Python: urllib.parse.urlencode({"match[]": '{instance="10.0.0.1"}'}) → 自动编码
+# curl:   curl -g -s 'http://..../series?match%5B%5D=%7Binstance%3D%2210.0.0.1%22%7D'
+# 经验: 涉及 match[] 时优先用 Python urllib，避免 curl 花括号/引号嵌套地狱
 
 # range query (summary computation in python)
 curl -s "$PROM_URL/api/v1/query_range?query=up&start=...&end=...&step=60s" ${AUTH_HEADER:+-H "$AUTH_HEADER"}
