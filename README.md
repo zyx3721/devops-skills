@@ -82,7 +82,7 @@
 
 ### 前置要求
 
-- [Hermes](https://github.com/anthropics/hermes) 平台已安装
+- [Hermes](https://github.com/NousResearch/hermes-agent) 平台已安装
 - Python 3.8+（部分技能需要）
 - Prometheus 实例（使用 `prometheus` 技能时）
 
@@ -217,9 +217,9 @@ metadata:
 
 ## 🔗 相关链接
 
-- [Hermes 官方文档](https://github.com/anthropics/hermes)
+- [Hermes 官方文档](https://hermes-agent.nousresearch.com/docs/zh-Hans/)
 - [Prometheus 官方文档](https://prometheus.io/docs/)
-- [问题反馈](https://github.com/Jerion2/devops-skills/issues)
+- [问题反馈](https://github.com/zyx3721/devops-skills/issues)
 
 ---
 
@@ -227,7 +227,7 @@ metadata:
 
 - 作者: Jerion
 - 邮箱: 416685476@qq.com
-- GitHub: [@Jerion2](https://github.com/Jerion2)
+- GitHub: [@zyx3721](https://github.com/zyx3721)
 
 ---
 
